@@ -10,8 +10,8 @@ from branca.colormap import linear
 # --- CARGA DE DATOS ---
 @st.cache_data
 def load_data():
-    df_2025 = pd.read_csv("C:\\Users\\usuario\\Downloads\\CONSOLIDACIÓN DE RSULTADOS 2025 - RESULTADOS 2025 (1).csv")
-    df_2023 = pd.read_csv("C:\\Users\\usuario\\Downloads\\CONSOLIDACIÓN RESULTADOS ELECCIONES 2023 - Hoja 1 (2).csv")
+    df_2025 = pd.read_csv("https://raw.githubusercontent.com/Facunfer/paginaresultados-2025/refs/heads/main/CONSOLIDACI%C3%93N%20DE%20RSULTADOS%202025%20-%20RESULTADOS%202025%20(1).csv")
+    df_2023 = pd.read_csv("https://raw.githubusercontent.com/Facunfer/paginaresultados-2025/refs/heads/main/CONSOLIDACI%C3%93N%20RESULTADOS%20ELECCIONES%202023%20-%20Hoja%201%20(2).csv")
 
     geo_url = "https://raw.githubusercontent.com/tartagalensis/circuitos_electorales_AR/main/geojson/CABA.geojson"
     geojson = requests.get(geo_url).json()
