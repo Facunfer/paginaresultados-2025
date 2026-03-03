@@ -1,525 +1,306 @@
 import streamlit as st
 import pandas as pd
+import geopandas as gpd
+import folium
+from streamlit_folium import folium_static
+from shapely.geometry import shape
 import requests
-import streamlit.components.v1 as components
+from branca.colormap import linear
 
-from typing import Tuple, Optional, Dict, Any, List
+# --- CARGA DE DATOS ---
+@st.cache_data
+def load_data():
+    df_2025 = pd.read_csv("https://raw.githubusercontent.com/Facunfer/paginaresultados-2025/refs/heads/main/CONSOLIDACI%C3%93N%20DE%20RSULTADOS%202025%20-%20RESULTADOS%202025%20(1).csv")
+    df_2023 = pd.read_csv("https://raw.githubusercontent.com/Facunfer/paginaresultados-2025/refs/heads/main/CONSOLIDACI%C3%93N%20RESULTADOS%20ELECCIONES%202023%20-%20Hoja%201%20(2).csv")
 
-# Optional deps
-try:
-    import geopandas as gpd
-    from shapely.geometry import shape
-except Exception:
-    gpd = None
+    geo_url = "https://raw.githubusercontent.com/tartagalensis/circuitos_electorales_AR/main/geojson/CABA.geojson"
+    geojson = requests.get(geo_url).json()
 
-try:
-    import folium
-    from folium.plugins import Fullscreen
-    from branca.colormap import linear as cm_linear
-except Exception:
-    folium = None
-    Fullscreen = None
-    cm_linear = None
+    features = []
+    for feat in geojson["features"]:
+        props = feat["properties"]
+        props["geometry"] = shape(feat["geometry"])
+        features.append(props)
 
-# =============================
-# CONFIG
-# =============================
-st.set_page_config(page_title="Resultados Electorales – CABA", page_icon="🗳️", layout="wide")
-APP_BG = "#6c4c99ff"
-APP_TEXT = "#ffffff"
-BAR_COLOR = "#371859ff"
-LINE_COLORS = {
-    "LLA": "#5f497aff",
-    "FUERZA PATRIA": "#00bfff",
-    "ALIANZA POTENCIA": "#800020",
-}
+    gdf = gpd.GeoDataFrame(features, geometry="geometry", crs="EPSG:4326")
+    gdf["circuito"] = gdf["circuito"].astype(str).str.zfill(5)
 
-# ===== Estilos globales y “tarjetas” =====
-st.markdown(
-    f"""
-<style>
-  .stApp {{
-    background-color: {APP_BG};
-    color: {APP_TEXT};
-    font-family: 'Montserrat', sans-serif;
-  }}
+    return df_2025, df_2023, gdf
 
-  .stMarkdown, .stMarkdown p, h1, h2, h3, h4, h5, h6,
-  .stCaption, label {{ color: {APP_TEXT} !important; }}
+# --- FUNCIÓN PARA ETIQUETAS EN EL MAPA (CIRCUITO + VALOR) ---
+def add_value_labels(m, gdf, col, formatter, show_circuit=True):
+    """
+    Coloca etiquetas sobre cada polígono:
+      - arriba: CIR XXXXX (si show_circuit=True)
+      - abajo: valor formateado (col)
+    Usa representative_point para que el texto quede dentro del polígono.
+    """
+    gdf_pts = gdf[gdf[col].notna()].copy()
+    gdf_pts["__pt__"] = gdf_pts.geometry.representative_point()
 
-  .stTabs [role="tab"], .stTabs [role="tab"] p {{ color: {APP_TEXT} !important; }}
-  [role="radiogroup"] label, [role="radiogroup"] label p {{ color: {APP_TEXT} !important; }}
+    for _, row in gdf_pts.iterrows():
+        val = row[col]
+        circuito = str(row.get("circuito", "")).zfill(5)
 
-  div[data-baseweb="select"] > div {{
-    background: rgba(255,255,255,0.10);
-    border: 1px solid #6c4c99ff !important;
-    color: {APP_TEXT} !important;
-    border-radius: 10px;
-  }}
-  div[data-baseweb="select"] span,
-  div[data-baseweb="select"] input {{ color: {APP_TEXT} !important; }}
-  div[data-baseweb="menu"] {{ background-color: rgba(0,0,0,0.35); color: {APP_TEXT}; }}
-  div[data-baseweb="option"] {{ color: {APP_TEXT}; }}
+        try:
+            text_val = formatter(val)
+        except Exception:
+            text_val = str(val)
 
-  .rounded-box {{
-    background: rgba(255, 255, 255, 0.07);
-    padding: 22px;
-    border-radius: 16px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.25);
-    margin-bottom: 24px;
-  }}
-
-  iframe, .folium-map, .vega-embed {{
-    border-radius: 16px !important;
-    overflow: hidden !important;
-    box-shadow: 0 3px 10px rgba(0,0,0,0.25);
-  }}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# Defaults (editables desde la barra lateral)
-DEFAULT_GEO_URL = "https://raw.githubusercontent.com/tartagalensis/circuitos_electorales_AR/main/geojson/CABA.geojson"
-DEFAULT_DIP_URL = "https://raw.githubusercontent.com/Facunfer/elecciones_octubre_2025/refs/heads/main/CSV%20RESULTADOS%20-%20diputados.csv"
-DEFAULT_SEN_URL = "https://raw.githubusercontent.com/Facunfer/elecciones_octubre_2025/refs/heads/main/CSV%20RESULTADOS%20-%20senadores.csv"
-
-PARTY_LLA = "ALIANZA LA LIBERTAD AVANZA"
-PARTY_FUERZA = "FUERZA PATRIA"
-PARTY_POTENCIA = "ALIANZA POTENCIA"
-
-# =============================
-# HELPERS
-# =============================
-@st.cache_data(show_spinner=False)
-def _github_to_raw(url: str) -> str:
-    if not url:
-        return url
-    if "github.com" in url and "/blob/" in url:
-        return url.replace("https://github.com/", "https://raw.githubusercontent.com/").replace("/blob/", "/")
-    return url
-
-@st.cache_data(show_spinner=False)
-def read_csv_url(url: str) -> pd.DataFrame:
-    url = _github_to_raw(url or "")
-    if not url:
-        return pd.DataFrame()
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    from io import BytesIO
-    df = pd.read_csv(BytesIO(resp.content))
-
-    df.columns = [c.strip().upper() for c in df.columns]
-    if "CIRCUITO" in df.columns:
-        df["CIRCUITO"] = df["CIRCUITO"].astype(str)
-    if "COMUNA" in df.columns:
-        df["COMUNA"] = df["COMUNA"].astype(str)
-    if "AGRUPACION_NOMBRE" in df.columns:
-        df["AGRUPACION_NOMBRE"] = df["AGRUPACION_NOMBRE"].astype(str).str.upper().str.replace(r"\s+", " ", regex=True)
-    if "VOTOS_CANTIDAD" in df.columns:
-        df["VOTOS_CANTIDAD"] = pd.to_numeric(df["VOTOS_CANTIDAD"], errors="coerce").fillna(0)
-    return df
-
-@st.cache_data(show_spinner=False)
-def load_geo(url: str) -> Tuple[pd.DataFrame, dict]:
-    url = _github_to_raw(url or "")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    gj = resp.json()
-
-    if gpd is not None:
-        feats = []
-        for f in gj.get("features", []):
-            p = f.get("properties", {}).copy()
-            try:
-                p["geometry"] = shape(f["geometry"])  # type: ignore
-            except Exception:
-                pass
-            feats.append(p)
-        gdf = gpd.GeoDataFrame(feats, geometry="geometry", crs="EPSG:4326")
-    else:
-        rows = [f.get("properties", {}) for f in gj.get("features", [])]
-        gdf = pd.DataFrame(rows)
-
-    for c in ["circuito", "coddepto"]:
-        if c in gdf.columns:
-            gdf[c] = gdf[c].astype(str)
-    return gdf, gj
-
-def assert_required(df: pd.DataFrame) -> None:
-    req = {"SECCION_NOMBRE", "COMUNA", "CIRCUITO", "AGRUPACION_NOMBRE", "VOTOS_CANTIDAD"}
-    missing = [c for c in req if c not in df.columns]
-    if missing:
-        st.error("Faltan columnas requeridas en el CSV: " + ", ".join(missing))
-        st.stop()
-
-def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    tot = (
-        df.groupby(["COMUNA", "CIRCUITO"], as_index=False)["VOTOS_CANTIDAD"]
-          .sum().rename(columns={"VOTOS_CANTIDAD": "TOTAL_VOTOS"})
-    )
-
-    def votes_for(party: str) -> pd.DataFrame:
-        part = df[df["AGRUPACION_NOMBRE"] == party]
-        if part.empty:
-            return pd.DataFrame({"COMUNA": [], "CIRCUITO": [], f"VOTOS_{party}": []})
-        return (
-            part.groupby(["COMUNA", "CIRCUITO"], as_index=False)["VOTOS_CANTIDAD"].sum()
-                .rename(columns={"VOTOS_CANTIDAD": f"VOTOS_{party}"})
-        )
-
-    lla = votes_for(PARTY_LLA)
-    fp  = votes_for(PARTY_FUERZA)
-    ap  = votes_for(PARTY_POTENCIA)
-
-    out = (
-        tot.merge(lla, on=["COMUNA", "CIRCUITO"], how="left")
-           .merge(fp,  on=["COMUNA", "CIRCUITO"], how="left")
-           .merge(ap,  on=["COMUNA", "CIRCUITO"], how="left")
-    )
-
-    for c in [f"VOTOS_{PARTY_LLA}", f"VOTOS_{PARTY_FUERZA}", f"VOTOS_{PARTY_POTENCIA}"]:
-        if c not in out.columns:
-            out[c] = 0
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
-
-    out["TOTAL_VOTOS"] = pd.to_numeric(out["TOTAL_VOTOS"], errors="coerce").fillna(0)
-
-    out["PORC_LLA"]      = (out[f"VOTOS_{PARTY_LLA}"]      / out["TOTAL_VOTOS"].replace(0, pd.NA) * 100).fillna(0.0)
-    out["PORC_FUERZA"]   = (out[f"VOTOS_{PARTY_FUERZA}"]   / out["TOTAL_VOTOS"].replace(0, pd.NA) * 100).fillna(0.0)
-    out["PORC_POTENCIA"] = (out[f"VOTOS_{PARTY_POTENCIA}"] / out["TOTAL_VOTOS"].replace(0, pd.NA) * 100).fillna(0.0)
-
-    return out
-
-def _detect_pad_len(geo_df: pd.DataFrame) -> int:
-    try:
-        return int(geo_df["circuito"].astype(str).str.len().max())
-    except Exception:
-        return 5
-
-def enrich_geojson_with_data(geojson_raw: dict, data: pd.DataFrame) -> dict:
-    by_circ = data.set_index("CIRCUITO").to_dict(orient="index")
-    import copy
-    gj = copy.deepcopy(geojson_raw)
-    for feat in gj.get("features", []):
-        props = feat.get("properties", {})
-        circ = str(props.get("circuito"))
-        row = by_circ.get(circ)
-        if row:
-            for key in [
-                k for k in row.keys()
-                if k in {"TOTAL_VOTOS", "PORC_LLA", "PORC_FUERZA", "PORC_POTENCIA"} or k.startswith("VOTOS_")
-            ]:
-                props[key] = row[key]
-        feat["properties"] = props
-    return gj
-
-def _filter_geojson_by_circuits(geojson_raw: dict, circuits: set) -> dict:
-    import copy
-    if not circuits:
-        return geojson_raw
-    gj = copy.deepcopy(geojson_raw)
-    gj["features"] = [f for f in gj.get("features", []) if str((f.get("properties", {}) or {}).get("circuito")) in circuits]
-    return gj
-
-def _centroid_from_geometry(geom: Dict[str, Any]) -> Optional[List[float]]:
-    try:
-        gtype = geom.get("type")
-        coords = geom.get("coordinates")
-        if not coords:
-            return None
-
-        def centroid_of_ring(ring: List[List[float]]) -> Optional[List[float]]:
-            xs, ys, n = 0.0, 0.0, 0
-            for pt in ring:
-                if not pt or len(pt) < 2:
-                    continue
-                xs += float(pt[0])
-                ys += float(pt[1])
-                n += 1
-            if n == 0:
-                return None
-            lon = xs / n
-            lat = ys / n
-            return [lat, lon]
-
-        if gtype == "Polygon":
-            return centroid_of_ring(coords[0])
-
-        if gtype == "MultiPolygon":
-            cents = []
-            for poly in coords:
-                if not poly or not poly[0]:
-                    continue
-                c = centroid_of_ring(poly[0])
-                if c:
-                    cents.append(c)
-            if not cents:
-                return None
-            return [sum(c[0] for c in cents) / len(cents), sum(c[1] for c in cents) / len(cents)]
-
-        if gtype == "Point":
-            lon, lat = coords
-            return [float(lat), float(lon)]
-
-    except Exception:
-        return None
-    return None
-
-def _format_metric_label(metric_col: str, value: Any) -> str:
-    if value is None or pd.isna(value):
-        return "-"
-    try:
-        if metric_col.startswith("PORC"):
-            return f"{float(value):.1f}%"
-        return f"{int(round(float(value))):,}".replace(",", ".")
-    except Exception:
-        return str(value)
-
-def make_map(
-    geojson_raw: dict,
-    joined_df: pd.DataFrame,
-    metric_col: str,
-    legend: str,
-    show_labels: bool = True,
-    max_labels: int = 9999,
-):
-    if folium is None or cm_linear is None:
-        st.warning("Instalá `folium` para ver el mapa.")
-        return None
-
-    gj_enriched = enrich_geojson_with_data(geojson_raw, joined_df)
-
-    m = folium.Map(location=[-34.61, -58.44], tiles="cartodbpositron", zoom_start=11, control_scale=True)
-
-    # ✅ Fullscreen (no bucle)
-    if Fullscreen is not None:
-        Fullscreen(
-            position="topleft",
-            title="Pantalla completa",
-            title_cancel="Salir de pantalla completa",
-            force_separate_button=True,
-        ).add_to(m)
-
-    vals = pd.to_numeric(joined_df[metric_col], errors="coerce").fillna(0)
-    vmin, vmax = float(vals.min()), float(vals.max())
-    if vmin == vmax:
-        vmax = vmin + (0.0001 if metric_col.startswith("PORC") else 1)
-
-    cmap = cm_linear.RdYlGn_11.scale(vmin, vmax)
-    cmap.caption = legend
-
-    v_by_circ = {str(r["CIRCUITO"]): float(r[metric_col]) for _, r in joined_df.iterrows()}
-
-    def style_fn(feat):
-        circ = str((feat.get("properties", {}) or {}).get("circuito"))
-        val = v_by_circ.get(circ)
-        if val is None or pd.isna(val):
-            return {"fillColor": "#00000000", "color": "#555", "weight": 0.7, "fillOpacity": 0.0}
-        return {"fillColor": cmap(val), "color": "#555", "weight": 0.7, "fillOpacity": 0.85}
-
-    gj = folium.GeoJson(
-        data=gj_enriched,
-        style_function=style_fn,
-        highlight_function=lambda f: {"weight": 2, "color": "#000"},
-        tooltip=folium.GeoJsonTooltip(
-            fields=["circuito", "coddepto", "TOTAL_VOTOS", "PORC_LLA"],
-            aliases=["Circuito", "Comuna", "Total votos", "% LLA"],
-            localize=True,
-            sticky=True,
-        ),
-        name=legend,
-    )
-    gj.add_to(m)
-    cmap.add_to(m)
-
-    # ✅ Labels: SIEMPRE muestra CIRCUITO + VALOR
-    if show_labels:
-        label_df = joined_df.copy()
-        if metric_col in label_df.columns:
-            label_df = label_df.sort_values(metric_col, ascending=False)
-
-        if max_labels is not None and max_labels > 0:
-            label_df = label_df.head(int(max_labels))
-
-        allow_circs = set(label_df["CIRCUITO"].astype(str).tolist())
-        by_circ_rows = label_df.set_index("CIRCUITO").to_dict(orient="index")
-
-        for feat in gj_enriched.get("features", []):
-            props = feat.get("properties", {}) or {}
-            circ = str(props.get("circuito"))
-            if circ not in allow_circs:
-                continue
-
-            center = _centroid_from_geometry(feat.get("geometry") or {})
-            if not center:
-                continue
-
-            row = by_circ_rows.get(circ, {})
-            val = row.get(metric_col, None)
-            metric_txt = _format_metric_label(metric_col, val)
-
-            # 🔥 label con “chip” de circuito arriba + métrica abajo
+        if show_circuit:
             html = f"""
             <div style="
-                font-family: Montserrat, sans-serif;
-                text-align: center;
-                line-height: 1.05;
-                padding: 6px 7px;
-                border-radius: 10px;
-                background: rgba(255,255,255,0.88);
+                font-family: Arial, sans-serif;
+                text-align:center;
+                line-height:1.05;
+                padding:6px 7px;
+                background: rgba(255,255,255,0.85);
                 border: 1px solid rgba(0,0,0,0.25);
-                box-shadow: 0 2px 6px rgba(0,0,0,0.20);
+                border-radius: 10px;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.20);
                 white-space: nowrap;
             ">
-              <div style="
-                  display:inline-block;
-                  font-size: 10px;
-                  font-weight: 900;
-                  letter-spacing: 0.6px;
-                  color: #111;
-                  padding: 2px 6px;
-                  border-radius: 999px;
-                  background: rgba(0,0,0,0.08);
-                  border: 1px solid rgba(0,0,0,0.15);
-                  margin-bottom: 4px;
-              ">
-                CIR {circ}
-              </div>
-              <div style="font-size: 13px; font-weight: 900; color: #000;">
-                {metric_txt}
-              </div>
+                <div style="
+                    display:inline-block;
+                    font-size:9.5px;
+                    font-weight:900;
+                    letter-spacing:0.5px;
+                    color:#111;
+                    padding:2px 6px;
+                    border-radius:999px;
+                    background: rgba(0,0,0,0.08);
+                    border: 1px solid rgba(0,0,0,0.15);
+                    margin-bottom:4px;
+                ">CIR {circuito}</div>
+                <div style="
+                    font-size:12px;
+                    font-weight:900;
+                    color:#000;
+                ">{text_val}</div>
             </div>
             """
+        else:
+            html = f"""
+            <div style="
+                font-size:10px;
+                font-weight:700;
+                padding:2px 4px;
+                background: rgba(255,255,255,0.75);
+                border: 1px solid rgba(0,0,0,0.2);
+                border-radius: 4px;
+                box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+                white-space: nowrap;
+            ">{text_val}</div>
+            """
 
-            folium.Marker(
-                location=center,
-                icon=folium.DivIcon(html=html),
-                tooltip=f"Circuito {circ} | {legend}: {metric_txt}",
-            ).add_to(m)
+        folium.Marker(
+            location=[row["__pt__"].y, row["__pt__"].x],
+            icon=folium.DivIcon(html=html),
+            tooltip=f"Circuito {circuito} | {col}: {text_val}",
+        ).add_to(m)
 
-    try:
-        bounds = gj.get_bounds()  # type: ignore
-        m.fit_bounds(bounds, padding=(10, 10))
-    except Exception:
-        pass
+# ======================
+# APP
+# ======================
+df_2025, df_2023, geo = load_data()
 
-    folium.LayerControl(collapsed=True).add_to(m)
-    return m
+# --- NORMALIZACIÓN ---
+df_2025.columns = df_2025.columns.str.lower().str.strip()
+df_2023.columns = df_2023.columns.str.lower().str.strip()
 
-# =============================
-# UI
-# =============================
-st.title("🗳️ Elecciones Octubre 2025")
+df_2025.rename(columns={"descripcion_candidatura": "partido", "sum cant_votos": "votos"}, inplace=True)
+df_2023.rename(columns={"agrupacion_nombre": "partido", "sum votos_cantidad": "votos", "circuito_id": "circuito"}, inplace=True)
 
-with st.sidebar:
-    st.subheader("Fuentes de datos (GitHub / RAW)")
-    geo_url = st.text_input("URL GeoJSON", value=DEFAULT_GEO_URL, help="Pegá URL GitHub o RAW; se convierte a RAW automáticamente.")
-    dip_url = st.text_input("CSV Diputados (URL)", value=DEFAULT_DIP_URL)
-    sen_url = st.text_input("CSV Senadores (URL)", value=DEFAULT_SEN_URL)
-    st.caption("Tip: usá URLs RAW de GitHub.")
+df_2025["partido"] = df_2025["partido"].str.upper()
+df_2023["partido"] = df_2023["partido"].str.upper()
+df_2025["circuito"] = df_2025["circuito"].astype(str).str.zfill(5)
+df_2023["circuito"] = df_2023["circuito"].astype(str).str.zfill(5)
 
-with st.spinner("Cargando datos…"):
-    try:
-        geo_gdf, geo_raw = load_geo(geo_url)
-    except Exception as e:
-        geo_gdf, geo_raw = pd.DataFrame(), {}
-        st.error(f"No se pudo cargar GeoJSON: {e}")
-
-    try:
-        df_dip = read_csv_url(dip_url) if dip_url else pd.DataFrame()
-        df_sen = read_csv_url(sen_url) if sen_url else pd.DataFrame()
-    except Exception as e:
-        st.error(f"No se pudieron cargar los CSV desde URL: {e}")
-        df_dip, df_sen = pd.DataFrame(), pd.DataFrame()
-
-if not df_dip.empty:
-    assert_required(df_dip)
+# --- ASIGNAR COLUMNA DE COMUNA ---
+if "comuna" in df_2025.columns:
+    df_2025["COMUNA"] = df_2025["comuna"].astype(str).str.upper()
 else:
-    st.warning("⚠️ Cargá la URL del CSV de Diputados en la barra lateral.")
-if not df_sen.empty:
-    assert_required(df_sen)
+    st.error("No se encontró la columna 'comuna' en df_2025.")
+    st.stop()
+
+if "seccion_nombre" in df_2023.columns:
+    df_2023["COMUNA"] = df_2023["seccion_nombre"].astype(str).str.upper()
 else:
-    st.warning("⚠️ Cargá la URL del CSV de Senadores en la barra lateral.")
+    st.error("No se encontró la columna 'seccion_nombre' en df_2023.")
+    st.stop()
 
-TAB_SEN, TAB_DIP = st.tabs(["Senadores", "Diputados"])
+# --- AGRUPACIÓN PRINCIPAL ---
+agrupacion = {
+    "LA LIBERTAD AVANZA": "LLA",
+    "ES AHORA BUENOS AIRES": "AHORA",
+    "UNION POR LA PATRIA": "AHORA"
+}
 
-def tab_body(nombre: str, df_cat: pd.DataFrame):
-    st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
-    st.subheader(nombre)
-    if df_cat.empty:
-        st.info("Subí un CSV válido para esta solapa.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+df_2025_agrup = df_2025[df_2025["partido"].isin(agrupacion)].copy()
+df_2025_agrup["grupo"] = df_2025_agrup["partido"].map(agrupacion)
 
-    pad_len = _detect_pad_len(geo_gdf) if not geo_gdf.empty else 5
-    df_cat = df_cat.copy()
-    if "CIRCUITO" in df_cat.columns:
-        df_cat["CIRCUITO"] = df_cat["CIRCUITO"].astype(str).str.zfill(pad_len)
+pivot_2025 = df_2025_agrup.pivot_table(
+    index="circuito",
+    columns="grupo",
+    values="votos",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
 
-    secciones = sorted(df_cat["SECCION_NOMBRE"].dropna().astype(str).unique()) if "SECCION_NOMBRE" in df_cat.columns else []
-    sel_secciones = st.multiselect(
-        "Filtrar por SECCIÓN (seccion_nombre)", options=["Todas"] + secciones, default=[], key=f"sec_multi_{nombre}"
-    )
+pivot_2023 = (
+    df_2023[df_2023["partido"] == "LA LIBERTAD AVANZA"]
+    .groupby("circuito")["votos"]
+    .sum()
+    .reset_index(name="votos_2023")
+)
 
-    if (not sel_secciones) or ("Todas" in sel_secciones):
-        df_fil = df_cat
-    else:
-        df_fil = df_cat[df_cat["SECCION_NOMBRE"].isin(sel_secciones)]
+total_2025 = df_2025.groupby("circuito")["votos"].sum().reset_index(name="total_2025")
+total_2023 = df_2023.groupby("circuito")["votos"].sum().reset_index(name="total_2023")
 
-    met = st.radio("Métrica para mapa y rankings", ["Cantidad de votos LLA", "% LLA"], horizontal=True, key=f"met_{nombre}")
-    show_labels = st.checkbox("Mostrar etiquetas sobre el mapa (CIR + valor)", value=True, key=f"lbl_{nombre}")
-    max_labels = st.slider("Máx. etiquetas en el mapa", min_value=10, max_value=500, value=120, step=10, key=f"lblmax_{nombre}")
+df_final = (
+    pivot_2025
+    .merge(pivot_2023, on="circuito", how="outer")
+    .merge(total_2025, on="circuito", how="left")
+    .merge(total_2023, on="circuito", how="left")
+)
+df_final.fillna(0, inplace=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+df_final["GANADOR"] = df_final.apply(lambda x: "LLA" if x.get("LLA", 0) > x.get("AHORA", 0) else "AHORA", axis=1)
+df_final["PORC_2025"] = df_final["LLA"] / df_final["total_2025"] * 100
+df_final["PORC_2023"] = df_final["votos_2023"] / df_final["total_2023"] * 100
+df_final["DIF_ABS"] = df_final["LLA"] - df_final["votos_2023"]
+df_final["DIF_PORC"] = df_final["PORC_2025"] - df_final["PORC_2023"]
 
-    met_df = compute_metrics(df_fil)
-    if met_df.empty:
-        st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
-        st.info("No hay datos para la selección actual.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+# --- TOOLTIP EXTRA: VOTOS POR PARTIDO ---
+df_tooltip = df_2025[df_2025["partido"].isin([
+    "LA LIBERTAD AVANZA", "ES AHORA BUENOS AIRES", "BUENOS AIRES PRIMERO"
+])]
+pivot_tooltip = df_tooltip.pivot_table(
+    index="circuito",
+    columns="partido",
+    values="votos",
+    aggfunc="sum",
+    fill_value=0
+).reset_index()
+pivot_tooltip.columns.name = None
+pivot_tooltip.rename(columns={
+    "LA LIBERTAD AVANZA": "LLA_TIP",
+    "ES AHORA BUENOS AIRES": "AHORA_TIP",
+    "BUENOS AIRES PRIMERO": "BA_PRIMERO_TIP"
+}, inplace=True)
 
-    met_df["CIRCUITO"] = met_df["CIRCUITO"].astype(str).str.zfill(pad_len)
+pivot_tooltip["circuito"] = pivot_tooltip["circuito"].astype(str).str.zfill(5)
+df_final = df_final.merge(pivot_tooltip, on="circuito", how="left")
 
-    if not geo_gdf.empty:
-        gjoin = geo_gdf[["circuito", "coddepto"]].copy()
-        gjoin.rename(columns={"circuito": "CIRCUITO", "coddepto": "CODDEPTO"}, inplace=True)
-        gjoin["CIRCUITO"] = gjoin["CIRCUITO"].astype(str).str.zfill(pad_len)
-        gjoin = gjoin.merge(met_df, on="CIRCUITO", how="left")
-    else:
-        gjoin = met_df.copy()
+# --- AÑADIR COMUNA A df_final ---
+comuna_por_circuito = df_2025[["circuito", "COMUNA"]].drop_duplicates()
+df_final = df_final.merge(comuna_por_circuito, on="circuito", how="left")
 
-    st.markdown('<div class="rounded-box">', unsafe_allow_html=True)
-    st.markdown("### 🗺️ Mapa coroplético por circuito")
+# --- UNIÓN CON GEO ---
+geo_final = geo.merge(df_final, on="circuito", how="left")
 
-    metric_col, legend = (f"VOTOS_{PARTY_LLA}", "Votos LLA") if met == "Cantidad de votos LLA" else ("PORC_LLA", "% LLA")
+# --- STREAMLIT INTERFAZ ---
+st.title("🗳️ Análisis Electoral por Circuito - CABA")
 
-    if geo_raw:
-        circuits_selected = set(met_df["CIRCUITO"].astype(str).unique())
-        filtered_geo = _filter_geojson_by_circuits(geo_raw, circuits_selected)
+# --- FILTRO POR COMUNA ---
+comunas_disponibles = sorted(geo_final["COMUNA"].dropna().unique())
+comuna_seleccionada = st.selectbox("Filtrar por comuna:", ["Todas"] + comunas_disponibles)
 
-        m = make_map(
-            filtered_geo,
-            gjoin[gjoin["CIRCUITO"].isin(circuits_selected)],
-            metric_col=metric_col,
-            legend=legend,
-            show_labels=show_labels,
-            max_labels=max_labels,
+if comuna_seleccionada != "Todas":
+    geo_filtrado = geo_final[geo_final["COMUNA"] == comuna_seleccionada].copy()
+else:
+    geo_filtrado = geo_final.copy()
+
+# --- VISTA ---
+vista = st.selectbox("Seleccioná la vista:", [
+    "1. Ganador por Circuito",
+    "2. Cantidad de Votos LLA 2025",
+    "3. Porcentaje LLA 2025",
+    "4. Crecimiento en Votos",
+    "5. Crecimiento Porcentual"
+])
+
+# --- Checks ---
+mostrar_etiquetas = st.checkbox("Mostrar etiquetas sobre el mapa (valor)", value=True)
+mostrar_circuito_en_etiqueta = st.checkbox("Mostrar también el N° de circuito (CIR XXXXX)", value=True)
+
+# --- MAPA ---
+m = folium.Map(location=[-34.61, -58.42], zoom_start=11)
+
+if vista.startswith("1"):
+    folium.GeoJson(
+        geo_filtrado,
+        style_function=lambda feature: {
+            "fillColor": "purple" if feature["properties"].get("GANADOR") == "LLA" else "green",
+            "color": "black",
+            "weight": 0.5,
+            "fillOpacity": 0.7,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["circuito", "LLA_TIP", "AHORA_TIP", "BA_PRIMERO_TIP"],
+            aliases=["Circuito", "LLA votos", "Ahora BsAs votos", "BA Primero votos"],
+            localize=True
+        )
+    ).add_to(m)
+
+    # ✅ Si querés también etiquetas en vista 1 (opcional). Descomentá:
+    # if mostrar_etiquetas:
+    #     add_value_labels(m, geo_filtrado, "GANADOR", lambda x: str(x), show_circuit=mostrar_circuito_en_etiqueta)
+
+else:
+    capa_info = {
+        "2": ("LLA", "Votos LLA 2025",
+              lambda x: f"{int(pd.to_numeric(x, errors='coerce') or 0):,}".replace(",", ".") + " votos"),
+        "3": ("PORC_2025", "% LLA 2025",
+              lambda x: f"{float(pd.to_numeric(x, errors='coerce') or 0):.1f}%"),
+        "4": ("DIF_ABS", "Crecimiento absoluto",
+              lambda x: f"{int(pd.to_numeric(x, errors='coerce') or 0):+} votos"),
+        "5": ("DIF_PORC", "Crecimiento porcentual",
+              lambda x: f"{float(pd.to_numeric(x, errors='coerce') or 0):+.1f}%")
+    }
+
+    col, legend, formatear = capa_info[vista[0]]
+
+    geo_filtrado[col] = pd.to_numeric(geo_filtrado[col], errors="coerce")
+    vmin = float(geo_filtrado[col].min() if pd.notna(geo_filtrado[col].min()) else 0)
+    vmax = float(geo_filtrado[col].max() if pd.notna(geo_filtrado[col].max()) else 0)
+
+    color_map = linear.RdYlGn_11.scale(vmin, vmax).to_step(n=10)
+    color_map.caption = legend
+
+    folium.GeoJson(
+        geo_filtrado,
+        style_function=lambda feat: {
+            "fillColor": color_map(feat["properties"][col]) if feat["properties"].get(col) is not None else "gray",
+            "color": "black",
+            "weight": 0.5,
+            "fillOpacity": 0.7,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["circuito", col],
+            aliases=["Circuito", legend],
+            localize=True,
+            labels=True
+        )
+    ).add_to(m)
+
+    color_map.add_to(m)
+
+    # --- ETIQUETAS SOBRE EL MAPA SOLO PARA VISTAS 2 y 3 ---
+    if mostrar_etiquetas and vista[0] in ("2", "3"):
+        if vista[0] == "2":
+            fmt_etiqueta = lambda x: f"{int(pd.to_numeric(x, errors='coerce') or 0):,}".replace(",", ".")
+        else:
+            fmt_etiqueta = lambda x: f"{float(pd.to_numeric(x, errors='coerce') or 0):.1f}%"
+
+        # ✅ Ahora muestra CIR + valor (según checkbox)
+        add_value_labels(
+            m,
+            geo_filtrado,
+            col,
+            fmt_etiqueta,
+            show_circuit=mostrar_circuito_en_etiqueta
         )
 
-        if m is not None:
-            components.html(m.get_root().render(), height=650, scrolling=False)
-    else:
-        st.warning("Sin GeoJSON cargado: se muestran solo tablas y gráficos.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with TAB_SEN:
-    tab_body("Senadores", df_sen)
-
-with TAB_DIP:
-    tab_body("Diputados", df_dip)
+folium_static(m)
 
